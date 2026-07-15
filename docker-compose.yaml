@@ -1,0 +1,19 @@
+version: "3.8"
+
+services:
+  discord-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: discord-bot
+    env_file:
+      - .env
+    restart: unless-stopped
+    volumes:
+      - ./logs:/app/logs
+    networks:
+      - discord-bot-network
+
+networks:
+  discord-bot-network:
+    driver: bridge
