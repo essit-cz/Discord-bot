@@ -72,7 +72,7 @@ def build_app():
 # ---------------------------------------------------------------------------
 
 async def graceful_shutdown(bot: DiscordBot, loop: asyncio.AbstractEventLoop) -> None:
-    """Gracefully shut down the bot."""
+    """Gracefully shut down the bot and all HTTP clients."""
     logger.info("Shutting down...")
     await bot.close()
     logger.info("Bot shut down.")

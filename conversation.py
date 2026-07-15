@@ -54,10 +54,9 @@ class ChannelHistory:
             for e in self.entries
         ]
 
-        # Trim to token budget.
+        # Trim to token budget (keep most recent).
         total_tokens = sum(estimate_tokens(m["content"]) for m in messages)
         if total_tokens > token_budget:
-            # Keep most recent messages.
             trimmed: List[dict] = []
             running = 0
             for m in reversed(messages):

@@ -23,7 +23,7 @@ import httpx
 
 from config import Config
 
-logger = logging.getLogger(__name__ + ".tools")
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -84,6 +84,10 @@ class Tool(abc.ABC):
             "details": "OK",
         }
 
+    async def close(self) -> None:
+        """Close any resources held by the tool (e.g., HTTP clients)."""
+        pass
+
 
 # ---------------------------------------------------------------------------
 # ToolRegistry
@@ -124,6 +128,7 @@ class ToolRegistry:
         return [t.metadata for t in self._tools.values()]
 
     def has(self, name: str) -> bool:
+        """Check if a tool with the given name is registered."""
         return name in self._tools
 
     async def execute(self, tool_name: str, query: str, **kwargs: Any) -> ToolResult:
@@ -148,6 +153,12 @@ class ToolRegistry:
         """Run health checks on all registered tools."""
         tasks = [t.health_check() for t in self._tools.values()]
         return await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def close(self) -> None:
+        """Close all registered tools."""
+        for tool in self._tools.values():
+            await tool.close()
+        logger.info("ToolRegistry closed (%d tools).", len(self._tools))
 
 
 # ---------------------------------------------------------------------------
@@ -177,7 +188,7 @@ _SEARCH_TRIGGERS_NEGATIVE = [
 ]
 
 
-def _should_search(query: str) -> bool:
+def should_search(query: str) -> bool:
     """Decide whether a query warrants a web search."""
     q = query.lower().strip()
     if not q or len(q) < 3:
@@ -189,11 +200,11 @@ def _should_search(query: str) -> bool:
     return any(pos in q for pos in _SEARCH_TRIGGERS_POSITIVE)
 
 
-def _sanitize_html(text: str) -> str:
-    """Strip HTML tags and escape common characters."""
-    text = re.sub(r"<[^>]+>", "", text)
-    text = html.unescape(text)
-    return text.strip()
+def sanitize_html(text: str) -> str:
+    """Strip HTML tags and unescape HTML entities from a string."""
+    clean = re.sub(r"<[^>]+>", "", text)
+    clean = html.unescape(clean)
+    return clean.strip()
 
 
 class SearchTool(Tool):
@@ -209,6 +220,7 @@ class SearchTool(Tool):
             timeout=httpx.Timeout(config.searxng_timeout),
             limits=httpx.Limits(max_connections=10, max_connections_per_host=5),
         )
+        logger.info("SearchTool initialized (base_url=%s).", config.searxng_base_url)
 
     @property
     def metadata(self) -> ToolMetadata:
@@ -231,8 +243,10 @@ class SearchTool(Tool):
                 return ToolResult.ok(data=[], message="No search results found")
             return ToolResult.ok(data=sanitized, message=f"Found {len(sanitized)} result(s)")
         except httpx.TimeoutException:
+            logger.warning("Search timed out for query: %s", query)
             return ToolResult.fail(data=[], message="Search timed out")
         except httpx.NetworkError as exc:
+            logger.warning("Search network error: %s", exc)
             return ToolResult.fail(data=[], message=f"Search network error: {exc}")
         except Exception as exc:
             logger.exception("Search failed for query: %s", query)
@@ -255,6 +269,11 @@ class SearchTool(Tool):
                 "details": str(exc),
             }
 
+    async def close(self) -> None:
+        """Close the underlying HTTP client."""
+        await self._client.aclose()
+        logger.info("SearchTool closed.")
+
     async def _search(self, query: str) -> List[Dict[str, Any]]:
         """Perform the raw SearXNG search."""
         params = {
@@ -274,18 +293,14 @@ class SearchTool(Tool):
             }
             for r in results
         ]
+
     def _sanitize_results(self, results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Sanitize search results (strip HTML, escape markdown)."""
         sanitized = []
         for r in results:
             sanitized.append({
-                "title": _sanitize_html(r.get("title", "")),
+                "title": sanitize_html(r.get("title", "")),
                 "url": r.get("url", ""),
-                "snippet": _sanitize_html(r.get("snippet", "")),
+                "snippet": sanitize_html(r.get("snippet", "")),
             })
         return sanitized
-
-
-def should_search(query: str) -> bool:
-    """Module-level convenience function for should_search logic."""
-    return _should_search(query)
