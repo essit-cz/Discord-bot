@@ -270,11 +270,10 @@ class SearchTool(Tool):
             {
                 "title": r.get("title", ""),
                 "url": r.get("url", ""),
-                "snippet": r.get("snippet", ""),
+                "snippet": r.get("content", r.get("snippet", "")),
             }
             for r in results
         ]
-
     def _sanitize_results(self, results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Sanitize search results (strip HTML, escape markdown)."""
         sanitized = []
