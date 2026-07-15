@@ -206,7 +206,7 @@ class SearchTool(Tool):
         self._config = config
         self._client = httpx.AsyncClient(
             base_url=config.searxng_base_url,
-            timeout=httpx.Timeout(config.search_timeout),
+            timeout=httpx.Timeout(config.searxng_timeout),
             limits=httpx.Limits(max_connections=10, max_connections_per_host=5),
         )
 
