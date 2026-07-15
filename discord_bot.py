@@ -308,16 +308,17 @@ class DiscordBot(commands.Bot):
         """Process a message and return the LLM response."""
         history = self._conversation_manager.get_history(channel_id)
 
-        search_context = ""
+        search_results = None
+        
         if search_enabled:
             search_result = await self._tool_registry.execute("search", content)
             if search_result.success and search_result.data:
-                search_context = self._format_search_context(search_result.data)
-
-        prompt = self._prompt_builder.build_prompt(
-            content=content,
+                search_results = search_result.data
+        
+        prompt = self._prompt_builder.build(
+            user_message=content,
             history=history,
-            search_context=search_context,
+            search_results=search_results,
         )
 
         images = self._extract_images(message)
