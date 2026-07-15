@@ -1,5 +1,8 @@
 """
 Health monitor — periodically checks the LLM and SearXNG backends.
+
+Runs a background task that pings both endpoints every 60 seconds
+and logs their status.
 """
 
 from __future__ import annotations
@@ -8,124 +11,44 @@ import asyncio
 import logging
 from typing import Dict, Optional
 
-import httpx
-
-from config import get_config
+from config import Config
 
 logger = logging.getLogger(__name__)
 
 
 class HealthMonitor:
     """
-    Monitors the health of the LLM and SearXNG backends.
+    Periodically pings the LLM and SearXNG backends.
 
-    Runs a periodic check (default: every 60 seconds) and stores the
-    latest status for each backend.
+    Responsibilities:
+    - Run a background health-check loop.
+    - Expose current health status.
+    - Start/stop the background task.
     """
 
-    def __init__(self) -> None:
-        config = get_config()
-        self._llm_url = config.llm_base_url.rstrip("/")
-        self._searxng_url = config.searxng_base_url.rstrip("/")
-        self._llm_timeout = config.llm_timeout
-        self._searxng_timeout = config.searxng_timeout
-
-        self._llm_healthy: bool = False
-        self._searxng_healthy: bool = False
-        self._model_name: str = config.llm_model
-        self._client: Optional[httpx.AsyncClient] = None
-        self._interval_seconds: int = 60
+    def __init__(self, config: Config, llm_client: object, search_client: object) -> None:
+        """
+        Args:
+            config: Application configuration.
+            llm_client: An LLMClient instance with a ``health_check()`` method.
+            search_client: A SearchClient instance with a ``health_check()`` method.
+        """
+        self._config = config
+        self._llm_client = llm_client
+        self._search_client = search_client
         self._task: Optional[asyncio.Task] = None
-
+        self._llm_healthy = False
+        self._search_healthy = False
+        self._model_name = config.llm_model
         logger.info("HealthMonitor initialized.")
 
-    async def _get_client(self) -> httpx.AsyncClient:
-        if self._client is None:
-            self._client = httpx.AsyncClient(
-                timeout=httpx.Timeout(10.0, connect=5.0),
-            )
-        return self._client
-
-    async def check_llm(self) -> bool:
-        """Check if the LLM backend responds to a GET /models request."""
-        client = await self._get_client()
-        try:
-            response = await client.get(
-                f"{self._llm_url}/models",
-                timeout=self._llm_timeout,
-            )
-            self._llm_healthy = response.status_code == 200
-            if self._llm_healthy:
-                data = response.json()
-                models = data.get("data", [])
-                if models:
-                    self._model_name = models[0].get("id", self._model_name)
-                logger.debug("LLM health check: OK (model=%s)", self._model_name)
-            else:
-                logger.warning("LLM health check: HTTP %d", response.status_code)
-        except Exception as exc:
-            self._llm_healthy = False
-            logger.warning("LLM health check failed: %s", exc)
-        return self._llm_healthy
-
-    async def check_searxng(self) -> bool:
-        """Check if the SearXNG backend responds to a simple search."""
-        client = await self._get_client()
-        try:
-            response = await client.get(
-                f"{self._searxng_url}/search",
-                params={"q": "test", "format": "json"},
-                timeout=self._searxng_timeout,
-            )
-            self._searxng_healthy = response.status_code == 200
-            if self._searxng_healthy:
-                logger.debug("SearXNG health check: OK")
-            else:
-                logger.warning("SearXNG health check: HTTP %d", response.status_code)
-        except Exception as exc:
-            self._searxng_healthy = False
-            logger.warning("SearXNG health check failed: %s", exc)
-        return self._searxng_healthy
-
-    async def check_all(self) -> dict:
-        """Run all health checks and return a summary dict."""
-        await asyncio.gather(self.check_llm(), self.check_searxng())
-        return self.get_status()
-
-    def get_status(self) -> dict:
-        """Return the latest cached health status."""
-        return {
-            "llm_healthy": self._llm_healthy,
-            "searxng_healthy": self._searxng_healthy,
-            "model_name": self._model_name,
-        }
-
-    def is_llm_healthy(self) -> bool:
-        return self._llm_healthy
-
-    def is_searxng_healthy(self) -> bool:
-        return self._searxng_healthy
-
-    def get_model_name(self) -> str:
-        return self._model_name
-
-    async def start(self, interval_seconds: int = 60) -> None:
-        """Start the periodic health check loop."""
-        self._interval_seconds = interval_seconds
-        self._task = asyncio.create_task(self._periodic_check())
-        logger.info("HealthMonitor started (interval=%ds).", interval_seconds)
-
-    async def _periodic_check(self) -> None:
-        """Run health checks every *interval_seconds*."""
-        while True:
-            try:
-                await self.check_all()
-            except Exception as exc:
-                logger.error("Periodic health check error: %s", exc)
-            await asyncio.sleep(self._interval_seconds)
+    async def start(self) -> None:
+        """Start the background health-check loop."""
+        self._task = asyncio.create_task(self._check_loop())
+        logger.info("HealthMonitor started (interval=60s).")
 
     async def stop(self) -> None:
-        """Stop the periodic health check loop."""
+        """Stop the background health-check loop."""
         if self._task:
             self._task.cancel()
             try:
@@ -133,7 +56,43 @@ class HealthMonitor:
             except asyncio.CancelledError:
                 pass
             self._task = None
-        if self._client:
-            await self._client.aclose()
-            self._client = None
-        logger.info("HealthMonitor stopped.")
+            logger.info("HealthMonitor stopped.")
+
+    async def _check_loop(self) -> None:
+        """Run health checks every 60 seconds."""
+        while True:
+            try:
+                await self._run_checks()
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.error("Health check error: %s", exc)
+
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                break
+
+    async def _run_checks(self) -> None:
+        """Execute a single round of health checks."""
+        llm_ok = await self._llm_client.health_check()
+        search_ok = await self._search_client.health_check()
+
+        llm_changed = llm_ok != self._llm_healthy
+        search_changed = search_ok != self._search_healthy
+
+        self._llm_healthy = llm_ok
+        self._search_healthy = search_ok
+
+        if llm_changed:
+            logger.info("LLM health: %s", "UP" if llm_ok else "DOWN")
+        if search_changed:
+            logger.info("SearXNG health: %s", "UP" if search_ok else "DOWN")
+
+    def get_status(self) -> Dict[str, object]:
+        """Return the current health status of all backends."""
+        return {
+            "llm_healthy": self._llm_healthy,
+            "searxng_healthy": self._search_healthy,
+            "model_name": self._model_name,
+        }

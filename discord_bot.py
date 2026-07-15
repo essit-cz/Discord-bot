@@ -4,6 +4,8 @@ DiscordBot — the main discord.py bot class.
 Wires together all sub-components (LLM, Search, Conversation,
 PromptBuilder, Formatter, HealthMonitor) and handles Discord events
 and commands.
+
+All dependencies are injected through the constructor.
 """
 
 from __future__ import annotations
@@ -16,7 +18,7 @@ from typing import Optional
 import discord
 from discord.ext import commands
 
-from config import get_config
+from config import Config
 from conversation import ConversationManager
 from formatter import MessageFormatter
 from health import HealthMonitor
@@ -45,20 +47,28 @@ class DiscordBot:
     - Automatic web search via SearXNG
     - Slash commands and prefix commands
     - Streaming-ready architecture
+
+    All dependencies are injected through the constructor.
     """
 
-    def __init__(self) -> None:
-        config = get_config()
+    def __init__(
+        self,
+        config: Config,
+        llm_client: LLMClient,
+        search_client: SearchClient,
+        conversation_manager: ConversationManager,
+        formatter: MessageFormatter,
+        prompt_builder: PromptBuilder,
+        health_monitor: HealthMonitor,
+    ) -> None:
+        self._config = config
+        self._llm_client = llm_client
+        self._search_client = search_client
+        self._conversation_manager = conversation_manager
+        self._formatter = formatter
+        self._prompt_builder = prompt_builder
+        self._health_monitor = health_monitor
 
-        # Sub-components.
-        self.conversation_manager = ConversationManager()
-        self.llm_client = LLMClient()
-        self.search_client = SearchClient()
-        self.prompt_builder = PromptBuilder()
-        self.formatter = MessageFormatter()
-        self.health_monitor = HealthMonitor()
-
-        # Discord bot instance.
         self._prefix = config.bot_prefix
         self._intents = _INTENTS
         self._search_enabled_global = config.search_enabled
@@ -71,7 +81,6 @@ class DiscordBot:
     def _get_bot(self) -> commands.Bot:
         """Lazily create the discord.py Bot instance."""
         if self._bot is None:
-            config = get_config()
             self._bot = commands.Bot(
                 command_prefix=self._prefix,
                 intents=self._intents,
@@ -90,7 +99,7 @@ class DiscordBot:
         async def on_ready():
             logger.info("Discord bot logged in as %s (ID: %s)", bot.user, bot.user.id)
             # Start the health monitor.
-            await self.health_monitor.start()
+            await self._health_monitor.start()
 
         @bot.event
         async def on_message(message: discord.Message) -> None:
@@ -134,6 +143,20 @@ class DiscordBot:
             # Process as a chat message.
             await self._handle_chat(message, content)
 
+        @bot.tree.error
+        async def on_tree_error(interaction: discord.Interaction, error: Exception) -> None:
+            logger.error("Slash command error: %s", error)
+            if isinstance(error, discord.app_commands.errors.CheckFailure):
+                await interaction.response.send_message(
+                    "⚙️ *You lack the required permissions.*",
+                    ephemeral=True,
+                )
+            else:
+                await interaction.response.send_message(
+                    "⚙️ *An unexpected error occurred.*",
+                    ephemeral=True,
+                )
+
         @bot.event
         async def on_command_error(
             ctx: commands.Context, error: commands.CommandError
@@ -159,9 +182,9 @@ class DiscordBot:
 
         @bot.command(name="status")
         async def cmd_status(ctx: commands.Context) -> None:
-            status = self.health_monitor.get_status()
-            stats = self.conversation_manager.get_stats()
-            response = self.formatter.format_status(
+            status = self._health_monitor.get_status()
+            stats = self._conversation_manager.get_stats()
+            response = self._formatter.format_status(
                 llm_ok=status["llm_healthy"],
                 search_ok=status["searxng_healthy"],
                 model=status["model_name"],
@@ -172,14 +195,14 @@ class DiscordBot:
         @bot.command(name="reset")
         async def cmd_reset(ctx: commands.Context) -> None:
             is_dm = isinstance(ctx.channel, discord.DMChannel)
-            count = self.conversation_manager.clear_history(
+            count = self._conversation_manager.clear_history(
                 ctx.channel.id, is_dm=is_dm
             )
-            await ctx.send(self.formatter.format_history_cleared(count))
+            await ctx.send(self._formatter.format_history_cleared(count))
 
         @bot.command(name="help")
         async def cmd_help(ctx: commands.Context) -> None:
-            response = self.formatter.format_help(self._prefix)
+            response = self._formatter.format_help(self._prefix)
             await ctx.send(response)
 
         @bot.command(name="search", aliases=["websearch"])
@@ -188,15 +211,15 @@ class DiscordBot:
         ) -> None:
             is_dm = isinstance(ctx.channel, discord.DMChannel)
             if action.lower() == "on":
-                self.conversation_manager.set_search_enabled(
+                self._conversation_manager.set_search_enabled(
                     ctx.channel.id, True, is_dm=is_dm
                 )
-                await ctx.send(self.formatter.format_search_enabled())
+                await ctx.send(self._formatter.format_search_enabled())
             elif action.lower() == "off":
-                self.conversation_manager.set_search_enabled(
+                self._conversation_manager.set_search_enabled(
                     ctx.channel.id, False, is_dm=is_dm
                 )
-                await ctx.send(self.formatter.format_search_disabled())
+                await ctx.send(self._formatter.format_search_disabled())
             else:
                 await ctx.send(f"⚙️ *Usage: {self._prefix}search [on|off]*")
 
@@ -204,10 +227,10 @@ class DiscordBot:
         async def cmd_history(ctx: commands.Context, action: str) -> None:
             if action.lower() == "clear":
                 is_dm = isinstance(ctx.channel, discord.DMChannel)
-                count = self.conversation_manager.clear_history(
+                count = self._conversation_manager.clear_history(
                     ctx.channel.id, is_dm=is_dm
                 )
-                await ctx.send(self.formatter.format_history_cleared(count))
+                await ctx.send(self._formatter.format_history_cleared(count))
             else:
                 await ctx.send(f"⚙️ *Usage: {self._prefix}history clear*")
 
@@ -222,9 +245,9 @@ class DiscordBot:
 
         @bot.tree.command(name="status", description="Show backend status")
         async def slash_status(interaction: discord.Interaction) -> None:
-            status = self.health_monitor.get_status()
-            stats = self.conversation_manager.get_stats()
-            response = self.formatter.format_status(
+            status = self._health_monitor.get_status()
+            stats = self._conversation_manager.get_stats()
+            response = self._formatter.format_status(
                 llm_ok=status["llm_healthy"],
                 search_ok=status["searxng_healthy"],
                 model=status["model_name"],
@@ -235,16 +258,16 @@ class DiscordBot:
         @bot.tree.command(name="reset", description="Clear conversation memory")
         async def slash_reset(interaction: discord.Interaction) -> None:
             is_dm = isinstance(interaction.channel, discord.DMChannel)
-            count = self.conversation_manager.clear_history(
+            count = self._conversation_manager.clear_history(
                 interaction.channel.id, is_dm=is_dm
             )
             await interaction.response.send_message(
-                self.formatter.format_history_cleared(count)
+                self._formatter.format_history_cleared(count)
             )
 
         @bot.tree.command(name="help", description="Show available commands")
         async def slash_help(interaction: discord.Interaction) -> None:
-            response = self.formatter.format_help(self._prefix)
+            response = self._formatter.format_help(self._prefix)
             await interaction.response.send_message(response)
 
         @bot.tree.command(name="search", description="Toggle web search")
@@ -254,18 +277,18 @@ class DiscordBot:
         ) -> None:
             is_dm = isinstance(interaction.channel, discord.DMChannel)
             if action.lower() == "on":
-                self.conversation_manager.set_search_enabled(
+                self._conversation_manager.set_search_enabled(
                     interaction.channel.id, True, is_dm=is_dm
                 )
                 await interaction.response.send_message(
-                    self.formatter.format_search_enabled()
+                    self._formatter.format_search_enabled()
                 )
             elif action.lower() == "off":
-                self.conversation_manager.set_search_enabled(
+                self._conversation_manager.set_search_enabled(
                     interaction.channel.id, False, is_dm=is_dm
                 )
                 await interaction.response.send_message(
-                    self.formatter.format_search_disabled()
+                    self._formatter.format_search_disabled()
                 )
             else:
                 await interaction.response.send_message(
@@ -279,11 +302,11 @@ class DiscordBot:
         ) -> None:
             if action.lower() == "clear":
                 is_dm = isinstance(interaction.channel, discord.DMChannel)
-                count = self.conversation_manager.clear_history(
+                count = self._conversation_manager.clear_history(
                     interaction.channel.id, is_dm=is_dm
                 )
                 await interaction.response.send_message(
-                    self.formatter.format_history_cleared(count)
+                    self._formatter.format_history_cleared(count)
                 )
             else:
                 await interaction.response.send_message(
@@ -301,7 +324,7 @@ class DiscordBot:
         is_dm = isinstance(message.channel, discord.DMChannel)
 
         # Check if search is enabled for this channel.
-        search_allowed = self.conversation_manager.is_search_enabled(
+        search_allowed = self._conversation_manager.is_search_enabled(
             channel_id, is_dm
         )
 
@@ -310,30 +333,30 @@ class DiscordBot:
 
         # Determine if we should search.
         search_results = None
-        if search_allowed and self.search_client.should_search(content):
+        if search_allowed and self._search_client.should_search(content):
             # Show typing indicator while searching.
             async with message.typing():
-                search_results = await self.search_client.search(content)
+                search_results = await self._search_client.search(content)
 
         # Get conversation history.
-        history = self.conversation_manager.get_messages(channel_id, is_dm)
+        history = self._conversation_manager.get_messages(channel_id, is_dm)
 
         # Build the prompt.
-        prompt_messages = self.prompt_builder.build(
+        prompt_messages = self._prompt_builder.build(
             user_message=content,
             history=history,
             search_results=search_results,
         )
 
         # Store the user message in history.
-        self.conversation_manager.add_message(
+        self._conversation_manager.add_message(
             channel_id, "user", content, is_dm
         )
 
         # Show typing indicator while the LLM processes.
         try:
             async with message.typing():
-                response = await self.llm_client.chat(
+                response = await self._llm_client.chat(
                     messages=prompt_messages,
                     image_url=image_url,
                 )
@@ -342,12 +365,12 @@ class DiscordBot:
             response = "⚙️ *The model returned an unexpected response.*"
 
         # Store the assistant response in history.
-        self.conversation_manager.add_message(
+        self._conversation_manager.add_message(
             channel_id, "assistant", response, is_dm
         )
 
         # Split and send the response.
-        chunks = self.formatter.format_response(response)
+        chunks = self._formatter.format_response(response)
         reply_target = message
 
         for i, chunk in enumerate(chunks):
@@ -370,18 +393,17 @@ class DiscordBot:
 
     async def start(self) -> None:
         """Start the Discord bot."""
-        config = get_config()
         bot = self._get_bot()
         await bot.tree.sync()
         logger.info("Slash commands synced.")
-        await bot.start(config.discord_token)
+        await bot.start(self._config.discord_token)
 
     async def close(self) -> None:
         """Gracefully shut down the bot and all sub-components."""
         logger.info("Shutting down DiscordBot...")
-        await self.health_monitor.stop()
-        await self.llm_client.close()
-        await self.search_client.close()
+        await self._health_monitor.stop()
+        await self._llm_client.close()
+        await self._search_client.close()
         if self._bot:
             await self._bot.close()
         logger.info("DiscordBot shut down complete.")

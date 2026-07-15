@@ -2,13 +2,13 @@
 Configuration module.
 
 Loads and validates all settings from a .env file using python-dotenv.
-Provides typed accessors so the rest of the bot never reads raw strings.
+Provides a typed, immutable Config dataclass.
 """
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -86,28 +86,3 @@ class Config:
             history_token_budget=int(os.getenv("HISTORY_TOKEN_BUDGET", "4096")),
             search_enabled=search_enabled,
         )
-
-
-# Module-level singleton — initialized once at startup.
-_config: Optional[Config] = None
-
-
-def get_config() -> Config:
-    """Return the current global Config instance."""
-    global _config
-    if _config is None:
-        raise RuntimeError("Config has not been loaded yet. Call `load_config()` first.")
-    return _config
-
-
-def load_config(env_path: Optional[Path] = None) -> Config:
-    """Load and store the global Config instance."""
-    global _config
-    _config = Config.load(env_path)
-    logger.info(
-        "Configuration loaded: model=%s, search=%s, history_budget=%d",
-        _config.llm_model,
-        _config.search_enabled,
-        _config.history_token_budget,
-    )
-    return _config
