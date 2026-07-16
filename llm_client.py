@@ -1,19 +1,14 @@
 """
-LLM client — communicates with a local vLLM OpenAI-compatible server.
-
-Uses a single reusable httpx.AsyncClient with retries and exponential
-backoff.  Supports chat completions, image messages, and optional
-streaming.
+Async vLLM OpenAI-compatible client.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-from typing import Any, AsyncIterator, Dict, List, Optional
+from typing import Any, AsyncIterator
 
 import httpx
-from tenacity import retry, stop_after_attempt, wait_exponential
 
 from config import Config
 
@@ -21,161 +16,159 @@ logger = logging.getLogger(__name__)
 
 
 class LLMClient:
-    """
-    Async client for a vLLM OpenAI-compatible endpoint.
-
-    Responsibilities:
-    - Maintain one reusable httpx.AsyncClient.
-    - Send chat completion requests (text + optional images).
-    - Support optional streaming responses.
-    - Handle retries with exponential backoff.
-    - Return friendly error messages (no raw stack traces).
-    """
+    """Reusable async client for OpenAI-compatible chat completions."""
 
     def __init__(self, config: Config) -> None:
         self._config = config
         self._client = httpx.AsyncClient(
-            base_url=config.llm_base_url,
+            base_url=config.vllm_base_url,
             timeout=httpx.Timeout(config.llm_timeout),
-            limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
+            limits=httpx.Limits(
+                max_connections=10,
+                max_keepalive_connections=5,
+            ),
+            headers={"Content-Type": "application/json"},
         )
-        logger.info("LLMClient initialized (base_url=%s, model=%s).",
-                     config.llm_base_url, config.llm_model)
 
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=1, max=10),
-        reraise=True,
-    )
     async def chat(
         self,
-        messages: List[Dict[str, str]],
-        image_url: Optional[str] = None,
+        messages: list[dict[str, Any]],
+        image_url: str | None = None,
         stream: bool = False,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
     ) -> str:
-        """
-        Send a chat completion request and return the assistant's response.
-
-        Args:
-            messages: List of ``{"role": ..., "content": ...}`` dicts.
-            image_url: Optional image URL to attach to the last user message.
-            stream: If True, use streaming (returns concatenated text).
-
-        Returns:
-            The assistant's text response.
-
-        Raises:
-            RuntimeError: On a friendly-wrapped backend error.
-        """
-        # Attach image to the last user message if provided.
-        if image_url:
-            messages = self._attach_image(messages, image_url)
-
-        payload = {
-            "model": self._config.llm_model,
-            "messages": messages,
-            "temperature": self._config.llm_temperature,
-            "max_tokens": self._config.llm_max_tokens,
-            "stream": stream,
-        }
+        """Create a chat completion and return a plain string."""
+        payload = self._build_payload(
+            messages=messages,
+            image_url=image_url,
+            stream=stream,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
 
         try:
             if stream:
-                return await self._chat_stream(payload)
-            else:
-                return await self._chat_standard(payload)
+                chunks: list[str] = []
+                async for chunk in self.stream_chat(
+                    messages=messages,
+                    image_url=image_url,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                ):
+                    chunks.append(chunk)
+                return "".join(chunks)
+
+            response = await self._client.post("/v1/chat/completions", json=payload)
+            response.raise_for_status()
+            data = response.json()
+            return self._extract_content(data)
         except httpx.TimeoutException:
-            logger.error("LLM request timed out after %.1fs.", self._config.llm_timeout)
-            raise RuntimeError("The model took too long to respond. Try again shortly.")
+            logger.warning("LLM request timed out")
+            return "Sorry, the AI backend timed out. Please try again."
         except httpx.HTTPStatusError as exc:
-            status = exc.response.status_code
-            body = exc.response.text
-            logger.error("LLM HTTP %d: %s", status, body[:200])
-            if status == 429:
-                raise RuntimeError("The model is busy (rate-limited). Try again shortly.")
-            elif status == 503:
-                raise RuntimeError("The model server is temporarily unavailable.")
-            else:
-                raise RuntimeError(f"The model server returned an unexpected error ({status}).")
-        except httpx.RequestError as exc:
-            logger.error("LLM request error: %s", exc)
-            raise RuntimeError("Could not reach the model server. Check your network.")
+            logger.error("LLM HTTP error: %s", exc.response.status_code)
+            return "Sorry, the AI backend returned an error. Please try again."
+        except Exception:
+            logger.exception("LLM request failed")
+            return "Sorry, something went wrong while contacting the AI backend."
 
-    async def _chat_standard(self, payload: Dict[str, Any]) -> str:
-        """Send a standard (non-streaming) chat request."""
-        response = await self._client.post(
-            "/chat/completions",
-            json=payload,
+    async def stream_chat(
+        self,
+        messages: list[dict[str, Any]],
+        image_url: str | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> AsyncIterator[str]:
+        """Yield streaming chat completion chunks."""
+        payload = self._build_payload(
+            messages=messages,
+            image_url=image_url,
+            stream=True,
+            temperature=temperature,
+            max_tokens=max_tokens,
         )
-        response.raise_for_status()
-        data = response.json()
-        content = data["choices"][0]["message"]["content"]
-        if not content:
-            raise RuntimeError("The model returned an empty response.")
-        return content
 
-    async def _chat_stream(self, payload: Dict[str, Any]) -> str:
-        """Send a streaming chat request and concatenate chunks."""
-        chunks: List[str] = []
-        async with self._client.stream("POST", "/chat/completions", json=payload) as resp:
-            resp.raise_for_status()
-            async for line in resp.aiter_lines():
-                if not line.startswith("data: "):
-                    continue
-                data_str = line[len("data: "):]
-                if data_str.strip() == "[DONE]":
-                    break
-                try:
-                    chunk = json.loads(data_str)
-                    delta = chunk["choices"][0]["delta"]
-                    if "content" in delta and delta["content"]:
-                        chunks.append(delta["content"])
-                except (json.JSONDecodeError, KeyError, IndexError):
-                    continue
-
-        result = "".join(chunks)
-        if not result:
-            raise RuntimeError("The model returned an empty streaming response.")
-        return result
-
-    def _attach_image(
-        self, messages: List[Dict[str, str]], image_url: str
-    ) -> List[Dict[str, Any]]:
-        """
-        Attach an image URL to the last user message in the message list.
-
-        Returns a new list with the modified message.
-        """
-        new_messages = []
-        for msg in messages:
-            if msg["role"] == "user":
-                # Replace the last user message with a content array.
-                new_messages.append({
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": msg["content"]},
-                        {"type": "image_url", "image_url": {"url": image_url}},
-                    ],
-                })
-            else:
-                new_messages.append(msg)
-        return new_messages
-
-    async def health_check(self) -> bool:
-        """
-        Ping the vLLM server's ``/v1/models`` endpoint.
-
-        Returns ``True`` if the server responds with a 200 OK.
-        """
         try:
-            resp = await self._client.get("/models")
-            resp.raise_for_status()
-            return True
-        except httpx.RequestError as exc:
-            logger.debug("LLM health check failed: %s", exc)
-            return False
+            async with self._client.stream(
+                "POST",
+                "/v1/chat/completions",
+                json=payload,
+            ) as response:
+                response.raise_for_status()
+                async for line in response.aiter_lines():
+                    if not line.startswith("data: "):
+                        continue
+                    data = line[6:].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        event = json.loads(data)
+                        delta = event["choices"][0].get("delta", {})
+                        content = delta.get("content")
+                        if content:
+                            yield content
+                    except (json.JSONDecodeError, KeyError, IndexError):
+                        continue
+        except Exception:
+            logger.exception("LLM streaming request failed")
+            yield "Sorry, something went wrong while streaming the AI response."
+
+    async def health_check(self) -> dict[str, Any]:
+        """Check backend health."""
+        try:
+            response = await self._client.get("/v1/models")
+            return {
+                "name": "llm",
+                "healthy": response.status_code < 500,
+                "status_code": response.status_code,
+            }
+        except Exception as exc:
+            return {"name": "llm", "healthy": False, "error": str(exc)}
 
     async def close(self) -> None:
-        """Close the underlying HTTP client."""
+        """Close the reusable HTTP client."""
         await self._client.aclose()
-        logger.info("LLMClient closed.")
+
+    def _build_payload(
+        self,
+        messages: list[dict[str, Any]],
+        image_url: str | None,
+        stream: bool,
+        temperature: float | None,
+        max_tokens: int | None,
+    ) -> dict[str, Any]:
+        model_messages = messages
+        if image_url:
+            model_messages = self._with_image(messages, image_url)
+
+        return {
+            "model": self._config.model_name,
+            "messages": model_messages,
+            "temperature": self._config.temperature if temperature is None else temperature,
+            "max_tokens": self._config.max_tokens if max_tokens is None else max_tokens,
+            "stream": stream,
+        }
+
+    def _with_image(self, messages: list[dict[str, Any]], image_url: str) -> list[dict[str, Any]]:
+        if not messages:
+            return messages
+
+        copied = [dict(message) for message in messages]
+        last = dict(copied[-1])
+        content = last.get("content", "")
+
+        last["content"] = [
+            {"type": "text", "text": str(content)},
+            {"type": "image_url", "image_url": {"url": image_url}},
+        ]
+        copied[-1] = last
+        return copied
+
+    def _extract_content(self, data: dict[str, Any]) -> str:
+        try:
+            content = data["choices"][0]["message"]["content"]
+            return str(content).strip()
+        except (KeyError, IndexError, TypeError):
+            logger.error("Unexpected LLM response schema")
+            return "Sorry, the AI backend returned an unexpected response."

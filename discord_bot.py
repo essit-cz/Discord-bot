@@ -1,16 +1,19 @@
 """
-DiscordBot — Main bot class.
+Discord bot orchestration.
 
-Wires together all injected dependencies and handles Discord events.
+This module contains Discord-specific event handling and command wiring. Shared
+dependencies are injected by main.py.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Dict, List, Optional
+from datetime import date
+from typing import Any
 
 import discord
+from discord import app_commands
 from discord.ext import commands
 
 from config import Config
@@ -18,25 +21,15 @@ from conversation import ConversationManager
 from formatter import MessageFormatter
 from llm_client import LLMClient
 from prompt_builder import PromptBuilder
-from tools import ToolRegistry
+from search_planner import SearchQueryPlanner, merge_search_results
+from tools import SearchTool, ToolRegistry
+from utils import is_valid_image_url
 
-logger = logging.getLogger(__name__ + ".discord_bot")
-
-# Discord message length limits
-_MESSAGE_LIMIT = 2000
-
-
-def _get_prefix(bot: commands.Bot, message: discord.Message) -> str:
-    """Dynamic prefix: '!' in guilds, '!' in DMs."""
-    return "!"
+logger = logging.getLogger(__name__)
 
 
 class DiscordBot(commands.Bot):
-    """Main Discord bot class.
-
-    All dependencies are injected through the constructor.
-    """
-    _MESSAGE_LIMIT = 2000
+    """Discord AI bot with injected dependencies."""
 
     def __init__(
         self,
@@ -46,285 +39,299 @@ class DiscordBot(commands.Bot):
         conversation_manager: ConversationManager,
         formatter: MessageFormatter,
         prompt_builder: PromptBuilder,
+        search_query_planner: SearchQueryPlanner,
     ) -> None:
-        intents = discord.Intents.default()
-        intents.message_content = True
-        intents.members = True
-        intents.dm_messages = True
-
-        super().__init__(
-            command_prefix=_get_prefix,
-            intents=intents,
-            help_command=None,
-        )
-
         self._config = config
         self._llm_client = llm_client
         self._tool_registry = tool_registry
         self._conversation_manager = conversation_manager
         self._formatter = formatter
         self._prompt_builder = prompt_builder
+        self._search_query_planner = search_query_planner
 
-        self._search_enabled: Dict[int, bool] = {}
+        intents = discord.Intents.default()
+        intents.message_content = True
+        intents.messages = True
+        intents.guilds = True
+        intents.dm_messages = True
 
-        self._register_commands()
+        super().__init__(
+            command_prefix=config.command_prefix,
+            intents=intents,
+            help_command=None,
+        )
 
-    # ------------------------------------------------------------------
-    # Command Registration
-    # ------------------------------------------------------------------
-
-    def _register_commands(self) -> None:
-        """Register all slash and prefix commands."""
-        self._register_slash_commands()
         self._register_prefix_commands()
 
-    def _register_slash_commands(self) -> None:
-        """Register all slash commands."""
-        @self.tree.command(name="ping", description="Check if the bot is alive")
-        async def ping(interaction: discord.Interaction) -> None:
-            latency = round(self.latency * 1000)
-            await interaction.response.send_message(f"🏓 Pong! {latency}ms", ephemeral=True)
-
-        @self.tree.command(name="status", description="Show bot status")
-        async def status(interaction: discord.Interaction) -> None:
-            status_text = self._get_status_text()
-            chunks = self._formatter.format_response(status_text)
-            for i, chunk in enumerate(chunks):
-                if i == 0:
-                    await interaction.response.send_message(chunk)
-                else:
-                    await interaction.followup.send(chunk)
-
-        @self.tree.command(name="reset", description="Reset conversation history for this channel")
-        async def reset(interaction: discord.Interaction) -> None:
-            channel_id = interaction.channel_id
-            self._conversation_manager.clear_history(channel_id)
-            await interaction.response.send_message("🔄 Conversation history reset.", ephemeral=True)
-
-        @self.tree.command(name="help", description="Show available commands")
-        async def help_cmd(interaction: discord.Interaction) -> None:
-            help_text = self._formatter.format_help("!")
-            chunks = self._formatter.format_response(help_text)
-            for i, chunk in enumerate(chunks):
-                if i == 0:
-                    await interaction.response.send_message(chunk)
-                else:
-                    await interaction.followup.send(chunk)
-
-        @self.tree.command(name="search", description="Toggle search for this channel")
-        @discord.app_commands.describe(action="on or off")
-        async def search_toggle(interaction: discord.Interaction, action: str) -> None:
-            channel_id = interaction.channel_id
-            action_lower = action.lower()
-            if action_lower == "on":
-                self._search_enabled[channel_id] = True
-                await interaction.response.send_message("🔍 Search enabled for this channel.", ephemeral=True)
-            elif action_lower == "off":
-                self._search_enabled[channel_id] = False
-                await interaction.response.send_message("🔎 Search disabled for this channel.", ephemeral=True)
-            else:
-                await interaction.response.send_message(f"Unknown action: '{action}'. Use 'on' or 'off'.", ephemeral=True)
-
-        @self.tree.command(name="history", description="Manage conversation history")
-        @discord.app_commands.describe(action="clear")
-        async def history_cmd(interaction: discord.Interaction, action: str) -> None:
-            if action.lower() == "clear":
-                channel_id = interaction.channel_id
-                self._conversation_manager.clear_history(channel_id)
-                await interaction.response.send_message("📜 History cleared.", ephemeral=True)
-            else:
-                await interaction.response.send_message(f"Unknown history action: '{action}'. Use 'clear'.", ephemeral=True)
-
-    def _register_prefix_commands(self) -> None:
-        """Register all prefix commands."""
-        @self.command(name="ping")
-        async def ping_prefix(ctx: commands.Context) -> None:
-            latency = round(self.latency * 1000)
-            await ctx.send(f"🏓 Pong! {latency}ms")
-
-        @self.command(name="status")
-        async def status_prefix(ctx: commands.Context) -> None:
-            status_text = self._get_status_text()
-            chunks = self._formatter.format_response(status_text)
-            for chunk in chunks:
-                await ctx.send(chunk)
-
-        @self.command(name="reset")
-        async def reset_prefix(ctx: commands.Context) -> None:
-            self._conversation_manager.clear_history(ctx.channel.id)
-            await ctx.send("🔄 Conversation history reset.")
-
-        @self.command(name="help")
-        async def help_prefix(ctx: commands.Context) -> None:
-            help_text = self._formatter.format_help("!")
-            chunks = self._formatter.format_response(help_text)
-            for chunk in chunks:
-                await ctx.send(chunk)
-
-        @self.command(name="search")
-        async def search_prefix(ctx: commands.Context, action: Optional[str] = None) -> None:
-            if action is None:
-                enabled = self._search_enabled.get(ctx.channel.id, self._config.search_enabled)
-                await ctx.send(f"Search is currently {'enabled' if enabled else 'disabled'} for this channel.")
-                return
-            action_lower = action.lower()
-            if action_lower == "on":
-                self._search_enabled[ctx.channel.id] = True
-                await ctx.send("🔍 Search enabled for this channel.")
-            elif action_lower == "off":
-                self._search_enabled[ctx.channel.id] = False
-                await ctx.send("🔎 Search disabled for this channel.")
-            else:
-                await ctx.send(f"Unknown action: '{action}'. Use 'on' or 'off'.")
-
-        @self.command(name="history")
-        async def history_prefix(ctx: commands.Context, action: Optional[str] = None) -> None:
-            if action and action.lower() == "clear":
-                self._conversation_manager.clear_history(ctx.channel.id)
-                await ctx.send("📜 History cleared.")
-            else:
-                await ctx.send("Usage: !history clear")
-
-    # ------------------------------------------------------------------
-    # Events
-    # ------------------------------------------------------------------
-
     async def setup_hook(self) -> None:
-        """Called when the bot is ready (after login)."""
-        logger.info("Logged in as %s (ID: %s)", self.user, self.user.id)
-        logger.info("Syncing commands...")
-        await self.tree.sync()
-        logger.info("Commands synced. Bot is ready.")
+        """Register slash commands."""
+        self.tree.add_command(self._slash_ping)
+        self.tree.add_command(self._slash_status)
+        self.tree.add_command(self._slash_reset)
+        self.tree.add_command(self._slash_help)
+        self.tree.add_command(self._slash_search)
+        self.tree.add_command(self._slash_history)
+
+        try:
+            synced = await self.tree.sync()
+            logger.info("Synced %s slash commands", len(synced))
+        except Exception:
+            logger.exception("Failed to sync slash commands")
+
+    async def close(self) -> None:
+        """Close Discord and all shared HTTP clients."""
+        await self._tool_registry.close()
+        await self._llm_client.close()
+        await super().close()
+
+    async def on_ready(self) -> None:
+        """Log readiness."""
+        logger.info("Logged in as %s (%s)", self.user, self.user.id if self.user else "unknown")
 
     async def on_message(self, message: discord.Message) -> None:
-        """Handle incoming messages."""
+        """Handle DMs and guild mentions while preserving prefix commands."""
         if message.author.bot:
             return
 
-        if message.author.id == self.user.id:
+        if message.content.startswith(str(self._config.command_prefix)):
+            await self.process_commands(message)
             return
 
-        # Let discord.py handle registered prefix commands.
-        await self.process_commands(message)
-
-        # Skip slash commands (handled by interaction handler).
-        if message.content.startswith("/"):
-            return
-
-        # Check if the bot was mentioned.
-        if not self._is_mentioned(message):
-            return
-
-        # Strip the mention from the content.
-        content = message.content
-        if self.user.mention in content:
-            content = content.replace(self.user.mention, "", 1).strip()
-
-        if not content:
-            return
-
-        await self.handle_message(message, content)
-
-    def _is_mentioned(self, message: discord.Message) -> bool:
-        """Check if the bot is mentioned in the message."""
         if isinstance(message.channel, discord.DMChannel):
-            return True
-        return self.user.mention in message.content
+            await self._handle_user_message(message, message.content)
+            return
 
-    async def handle_message(self, message: discord.Message, content: str) -> None:
-        """Handle a user message (mention or DM)."""
-        channel_id = message.channel.id
-        is_dm = isinstance(message.channel, discord.DMChannel)
+        if self.user and self.user in message.mentions:
+            content = self._remove_bot_mentions(message.content)
+            await self._handle_user_message(message, content)
 
-        # Check if search is enabled for this channel.
-        search_enabled = self._search_enabled.get(channel_id, self._config.search_enabled)
-        if not self._conversation_manager.is_search_enabled(channel_id):
-            search_enabled = False
+    async def _handle_user_message(self, message: discord.Message, user_content: str) -> None:
+        channel_id = self._channel_key(message)
+        content = user_content.strip()
+        if not content and not message.attachments:
+            return
 
-        # Show typing indicator.
+        image_url = self._extract_image_url(message)
+        history = self._conversation_manager.get_messages(channel_id)
+
         async with message.channel.typing():
-            try:
-                # Get conversation history.
-                history = self._conversation_manager.get_messages(channel_id, is_dm=is_dm)
+            search_results = await self._maybe_search(
+                user_message=content,
+                history=history,
+                channel_id=channel_id,
+            )
 
-                # Determine if we should search.
-                search_results = None
-                if search_enabled:
-                    search_results = await self._perform_search(content)
+            prompt_messages = self._prompt_builder.build(
+                user_message=content,
+                history=history,
+                search_results=search_results,
+            )
+            response = await self._llm_client.chat(
+                messages=prompt_messages,
+                image_url=image_url,
+                stream=False,
+            )
 
-                # Build the prompt.
-                prompt = self._prompt_builder.build(content, history, search_results)
+        self._conversation_manager.add_message(channel_id, "user", content)
+        self._conversation_manager.add_message(channel_id, "assistant", response)
 
-                # Check for images in the message.
-                image_url = self._extract_image_url(message)
+        for chunk in self._formatter.format_response(response):
+            await message.reply(
+                chunk,
+                mention_author=False,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
 
-                # Get the LLM response.
-                response = await self._llm_client.chat(prompt, image_url=image_url)
+    async def _maybe_search(
+        self,
+        user_message: str,
+        history: list[dict[str, str]],
+        channel_id: str,
+    ) -> list[dict[str, Any]]:
+        if not user_message:
+            return []
 
-                # Store the exchange in conversation history.
-                self._conversation_manager.add_message(channel_id, "user", content, is_dm=is_dm)
-                self._conversation_manager.add_message(channel_id, "assistant", response, is_dm=is_dm)
+        if hasattr(self._conversation_manager, "is_search_enabled"):
+            if not self._conversation_manager.is_search_enabled(channel_id):
+                return []
 
-                # Format and send the response.
-                chunks = self._formatter.format_response(response)
-                for i, chunk in enumerate(chunks):
-                    if i == 0:
-                        await message.reply(chunk)
-                    else:
-                        await message.channel.send(chunk)
+        tool = self._tool_registry.get("search")
+        if not isinstance(tool, SearchTool):
+            return []
 
-            except Exception as exc:
-                logger.exception("Error handling message in channel %d", channel_id)
-                friendly_msg = self._formatter.format_error(str(exc))
-                await message.reply(friendly_msg)
+        if not tool.should_search(user_message):
+            return []
 
-    async def _perform_search(self, query: str) -> Optional[List[dict]]:
-        """Perform a web search if the tool is available."""
-        try:
-            result = await self._tool_registry.execute("search", query)
-            if result.success and result.data:
-                return result.data
-        except Exception as exc:
-            logger.warning("Search failed: %s", exc)
-        return None
-
-    def _extract_image_url(self, message: discord.Message) -> Optional[str]:
-        """Extract the first valid image URL from a Discord message."""
-        from utils import is_valid_image_url
-
-        # Check attachments first.
-        for attachment in message.attachments:
-            if is_valid_image_url(attachment.url):
-                return attachment.url
-
-        # Check embeds.
-        for embed in message.embeds:
-            if embed.image and is_valid_image_url(embed.image.url):
-                return embed.image.url
-
-        # Check content for image URLs.
-        import re
-        urls = re.findall(r"https?://\S+\.(?:png|jpg|jpeg|gif|webp|bmp)\b", message.content)
-        for url in urls:
-            if is_valid_image_url(url):
-                return url
-
-        return None
-
-    def _get_status_text(self) -> str:
-        """Build a status text showing backend health."""
-        history_stats = self._conversation_manager.get_stats()
-        return self._formatter.format_status(
-            llm_ok=True,
-            search_ok=self._tool_registry.has("search"),
-            model=self._config.llm_model,
-            history_stats=history_stats,
+        plan = await self._search_query_planner.plan(
+            user_message=user_message,
+            history=history,
+            current_date=date.today(),
         )
 
-    async def close(self) -> None:
-        """Close the bot and all injected HTTP clients."""
-        logger.info("Closing bot and HTTP clients...")
-        await self._llm_client.close()
-        await self._tool_registry.close()
-        await super().close()
-        logger.info("Bot and HTTP clients closed.")
+        queries = plan.queries[:3]
+        tasks = [self._tool_registry.execute("search", query, limit=5) for query in queries]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        groups: list[list[dict[str, Any]]] = []
+        result_counts: dict[str, int] = {}
+
+        for query, result in zip(queries, results, strict=False):
+            if isinstance(result, Exception):
+                logger.exception("Planned search failed for query: %s", query[:120])
+                result_counts[query] = 0
+                groups.append([])
+                continue
+
+            data = result.data if result.success and isinstance(result.data, list) else []
+            result_counts[query] = len(data)
+            groups.append(data)
+
+        merged = merge_search_results(groups, limit=8)
+        logger.info(
+            "Search pipeline completed",
+            extra={
+                "original_query": user_message[:300],
+                "planned_queries": queries,
+                "result_counts": result_counts,
+                "fallback_used": plan.fallback_used,
+                "combined_result_count": len(merged),
+            },
+        )
+        return merged
+
+    def _register_prefix_commands(self) -> None:
+        @self.command(name="ping")
+        async def ping_command(ctx: commands.Context) -> None:
+            await ctx.reply("Pong!", mention_author=False)
+
+        @self.command(name="status")
+        async def status_command(ctx: commands.Context) -> None:
+            await ctx.reply(
+                self._format_status(),
+                mention_author=False,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+
+        @self.command(name="reset")
+        async def reset_command(ctx: commands.Context) -> None:
+            self._conversation_manager.clear_history(self._channel_key(ctx.message))
+            await ctx.reply("Conversation history cleared.", mention_author=False)
+
+        @self.command(name="help")
+        async def help_command(ctx: commands.Context) -> None:
+            await ctx.reply(
+                self._formatter.format_help(str(self._config.command_prefix)),
+                mention_author=False,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+
+        @self.group(name="search", invoke_without_command=True)
+        async def search_group(ctx: commands.Context) -> None:
+            await ctx.reply("Usage: !search on or !search off", mention_author=False)
+
+        @search_group.command(name="on")
+        async def search_on(ctx: commands.Context) -> None:
+            self._set_search_enabled(self._channel_key(ctx.message), True)
+            await ctx.reply("Web search enabled for this conversation.", mention_author=False)
+
+        @search_group.command(name="off")
+        async def search_off(ctx: commands.Context) -> None:
+            self._set_search_enabled(self._channel_key(ctx.message), False)
+            await ctx.reply("Web search disabled for this conversation.", mention_author=False)
+
+        @self.group(name="history", invoke_without_command=True)
+        async def history_group(ctx: commands.Context) -> None:
+            await ctx.reply("Usage: !history clear", mention_author=False)
+
+        @history_group.command(name="clear")
+        async def history_clear(ctx: commands.Context) -> None:
+            self._conversation_manager.clear_history(self._channel_key(ctx.message))
+            await ctx.reply("Conversation history cleared.", mention_author=False)
+
+    @app_commands.command(name="ping", description="Check whether the bot is alive.")
+    async def _slash_ping(self, interaction: discord.Interaction) -> None:
+        await interaction.response.send_message("Pong!", ephemeral=True)
+
+    @app_commands.command(name="status", description="Show bot status.")
+    async def _slash_status(self, interaction: discord.Interaction) -> None:
+        await interaction.response.send_message(self._format_status(), ephemeral=True)
+
+    @app_commands.command(name="reset", description="Clear this conversation history.")
+    async def _slash_reset(self, interaction: discord.Interaction) -> None:
+        channel_id = self._interaction_channel_key(interaction)
+        self._conversation_manager.clear_history(channel_id)
+        await interaction.response.send_message("Conversation history cleared.", ephemeral=True)
+
+    @app_commands.command(name="help", description="Show bot help.")
+    async def _slash_help(self, interaction: discord.Interaction) -> None:
+        await interaction.response.send_message(
+            self._formatter.format_help(str(self._config.command_prefix)),
+            ephemeral=True,
+        )
+
+    @app_commands.command(name="search", description="Enable or disable web search.")
+    @app_commands.describe(action="on or off")
+    async def _slash_search(self, interaction: discord.Interaction, action: str) -> None:
+        normalized = action.lower().strip()
+        if normalized not in {"on", "off"}:
+            await interaction.response.send_message("Use /search on or /search off.", ephemeral=True)
+            return
+
+        self._set_search_enabled(self._interaction_channel_key(interaction), normalized == "on")
+        await interaction.response.send_message(
+            f"Web search {'enabled' if normalized == 'on' else 'disabled'} for this conversation.",
+            ephemeral=True,
+        )
+
+    @app_commands.command(name="history", description="Manage conversation history.")
+    @app_commands.describe(action="clear")
+    async def _slash_history(self, interaction: discord.Interaction, action: str) -> None:
+        if action.lower().strip() != "clear":
+            await interaction.response.send_message("Use /history clear.", ephemeral=True)
+            return
+
+        self._conversation_manager.clear_history(self._interaction_channel_key(interaction))
+        await interaction.response.send_message("Conversation history cleared.", ephemeral=True)
+
+    def _format_status(self) -> str:
+        stats = self._conversation_manager.get_stats()
+        tools = ", ".join(tool.name for tool in self._tool_registry.list_tools()) or "none"
+        return (
+            "**Status**\n"
+            f"- Model: `{self._config.model_name}`\n"
+            f"- Tools: `{tools}`\n"
+            f"- Conversations: `{stats}`"
+        )
+
+    def _channel_key(self, message: discord.Message) -> str:
+        if isinstance(message.channel, discord.DMChannel):
+            return f"dm:{message.author.id}"
+        return f"guild:{message.guild.id if message.guild else 'unknown'}:channel:{message.channel.id}"
+
+    def _interaction_channel_key(self, interaction: discord.Interaction) -> str:
+        if interaction.guild_id is None:
+            return f"dm:{interaction.user.id}"
+        return f"guild:{interaction.guild_id}:channel:{interaction.channel_id}"
+
+    def _remove_bot_mentions(self, content: str) -> str:
+        if not self.user:
+            return content
+        return (
+            content.replace(f"<@{self.user.id}>", "")
+            .replace(f"<@!{self.user.id}>", "")
+            .strip()
+        )
+
+    def _extract_image_url(self, message: discord.Message) -> str | None:
+        for attachment in message.attachments:
+            url = attachment.url
+            content_type = attachment.content_type or ""
+            if content_type.startswith("image/") and is_valid_image_url(url):
+                return url
+            if is_valid_image_url(url):
+                return url
+        return None
+
+    def _set_search_enabled(self, channel_id: str, enabled: bool) -> None:
+        if hasattr(self._conversation_manager, "set_search_enabled"):
+            self._conversation_manager.set_search_enabled(channel_id, enabled)

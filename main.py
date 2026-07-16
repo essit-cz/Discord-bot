@@ -15,6 +15,7 @@ from discord_bot import DiscordBot
 from formatter import MessageFormatter
 from llm_client import LLMClient
 from prompt_builder import PromptBuilder
+from search_planner import SearchQueryPlanner
 from tools import SearchTool, ToolRegistry
 
 # ---------------------------------------------------------------------------
@@ -51,6 +52,9 @@ def build_app():
     # Prompt builder
     prompt_builder = PromptBuilder()
 
+    # Search query planner
+    search_query_planner = SearchQueryPlanner(llm_client)
+
     # Formatter
     formatter = MessageFormatter()
 
@@ -62,6 +66,7 @@ def build_app():
         conversation_manager=conversation_manager,
         formatter=formatter,
         prompt_builder=prompt_builder,
+        search_query_planner=search_query_planner,
     )
 
     return bot
