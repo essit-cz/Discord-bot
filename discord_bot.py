@@ -65,12 +65,48 @@ class DiscordBot(commands.Bot):
 
     async def setup_hook(self) -> None:
         """Register slash commands."""
-        self.tree.add_command(self._slash_ping)
-        self.tree.add_command(self._slash_status)
-        self.tree.add_command(self._slash_reset)
-        self.tree.add_command(self._slash_help)
-        self.tree.add_command(self._slash_search)
-        self.tree.add_command(self._slash_history)
+
+        @self.tree.command(name="ping", description="Check whether the bot is alive.")
+        async def slash_ping(interaction: discord.Interaction) -> None:
+            await interaction.response.send_message("Pong!", ephemeral=True)
+
+        @self.tree.command(name="status", description="Show bot status.")
+        async def slash_status(interaction: discord.Interaction) -> None:
+            await interaction.response.send_message(self._format_status(), ephemeral=True)
+
+        @self.tree.command(name="reset", description="Clear this conversation history.")
+        async def slash_reset(interaction: discord.Interaction) -> None:
+            self._conversation_manager.clear_history(self._interaction_channel_key(interaction))
+            await interaction.response.send_message("Conversation history cleared.", ephemeral=True)
+
+        @self.tree.command(name="help", description="Show bot help.")
+        async def slash_help(interaction: discord.Interaction) -> None:
+            await interaction.response.send_message(
+                self._formatter.format_help(str(self._config.command_prefix)),
+                ephemeral=True,
+            )
+
+        @self.tree.command(name="search", description="Enable or disable web search.")
+        @app_commands.describe(action="on or off")
+        async def slash_search(interaction: discord.Interaction, action: str) -> None:
+            normalized = action.lower().strip()
+            if normalized not in {"on", "off"}:
+                await interaction.response.send_message("Use /search on or /search off.", ephemeral=True)
+                return
+            self._set_search_enabled(self._interaction_channel_key(interaction), normalized == "on")
+            await interaction.response.send_message(
+                f"Web search {'enabled' if normalized == 'on' else 'disabled'} for this conversation.",
+                ephemeral=True,
+            )
+
+        @self.tree.command(name="history", description="Manage conversation history.")
+        @app_commands.describe(action="clear")
+        async def slash_history(interaction: discord.Interaction, action: str) -> None:
+            if action.lower().strip() != "clear":
+                await interaction.response.send_message("Use /history clear.", ephemeral=True)
+                return
+            self._conversation_manager.clear_history(self._interaction_channel_key(interaction))
+            await interaction.response.send_message("Conversation history cleared.", ephemeral=True)
 
         try:
             synced = await self.tree.sync()
