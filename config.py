@@ -8,6 +8,7 @@ Provides a typed, immutable Config dataclass.
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -58,8 +59,6 @@ class Config:
             logger.info("Loaded .env file: %s", env_file)
         else:
             logger.info("No .env file found at %s; falling back to environment variables.", env_file)
-
-        import os
 
         discord_token = os.getenv("DISCORD_TOKEN")
         if not discord_token:
